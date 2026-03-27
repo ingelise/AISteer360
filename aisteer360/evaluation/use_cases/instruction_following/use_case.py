@@ -1,9 +1,12 @@
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from aisteer360.evaluation.use_cases.base import UseCase
 from aisteer360.evaluation.utils.generation_utils import batch_retry_generate
+
+logger = logging.getLogger(__name__)
 
 _EVALUATION_REQ_KEYS = [
     "prompt",
@@ -49,7 +52,7 @@ class InstructionFollowing(UseCase):
         tokenizer,
         gen_kwargs: dict | None = None,
         runtime_overrides: dict[tuple[str, str], str] | None = None,
-        **__
+        **kwargs
     ) -> list[dict[str, Any]]:
         """Generates model responses for instruction following prompts.
 
@@ -59,7 +62,8 @@ class InstructionFollowing(UseCase):
             model_or_pipeline: Either a HuggingFace model or SteeringPipeline instance to use for generation.
             tokenizer: Tokenizer for encoding/decoding text.
             gen_kwargs: Optional generation parameters passed to the model's generate method.
-            runtime_overrides: Optional runtime parameter overrides for steering controls, structured as {(pipeline_name, param_name): value}.
+            runtime_overrides: Optional runtime parameter overrides for steering controls, structured as
+                {(pipeline_name, param_name): value}.
 
         Returns:
             List of generation dictionaries, each containing:
@@ -71,12 +75,13 @@ class InstructionFollowing(UseCase):
                 - "kwargs": Additional metadata for instruction evaluation
         """
         if not self.evaluation_data:
-            print("No evaluation data provided.")
+            logger.warning("No evaluation data provided")
             return []
-
         gen_kwargs = dict(gen_kwargs or {})
-        prompt_data = []
+        batch_size: int = int(kwargs["batch_size"])
 
+        # form prompt data
+        prompt_data = []
         for instance in self.evaluation_data:
             user_prompt = [{"role": "user", "content": instance["prompt"]}]
             prompt_data.append({"prompt": user_prompt})
@@ -88,6 +93,7 @@ class InstructionFollowing(UseCase):
             gen_kwargs=gen_kwargs,
             runtime_overrides=runtime_overrides,
             evaluation_data=self.evaluation_data,
+            batch_size=batch_size
         )
 
         generations = [
@@ -137,16 +143,20 @@ class InstructionFollowing(UseCase):
         steering_methods, predictions, follow_instructions = [], {}, {}
         inputs = None
 
-        for steering_method, results in profiles.items():
-            generations = results.pop("generations")
+        for steering_method, runs in profiles.items():
+            # profiles maps pipeline names to a list of run dicts (one per trial); use the first trial for the
+            # per-question response export
+            first_run = runs[0] if isinstance(runs, list) else runs
+            generations = first_run["generations"]
             steering_methods.append(steering_method)
             predictions[steering_method] = [gen["response"] for gen in generations]
 
             # get instruction following details from the StrictInstruction metric
-            if "StrictInstruction" in results["evaluations"]:
-                follow_instructions[steering_method] = results["evaluations"][
+            evaluations = first_run.get("evaluations", {})
+            if "StrictInstruction" in evaluations:
+                follow_instructions[steering_method] = evaluations[
                     "StrictInstruction"
-                ].pop("follow_all_instructions")
+                ].get("follow_all_instructions", [])
             if not inputs:
                 inputs = [gen["prompt"] for gen in generations]
 
@@ -160,5 +170,15 @@ class InstructionFollowing(UseCase):
 
         with open(folder_path / "responses.json", "w") as f:
             json.dump(responses, f, indent=4)
+
+        # build a scores-only view (everything except the bulky per-example generations)
+        scores_only: dict[str, Any] = {}
+        for steering_method, runs in profiles.items():
+            run_list = runs if isinstance(runs, list) else [runs]
+            scores_only[steering_method] = [
+                {k: v for k, v in run.items() if k != "generations"}
+                for run in run_list
+            ]
+
         with open(folder_path / "scores.json", "w") as f:
-            json.dump(profiles, f, indent=4)
+            json.dump(scores_only, f, indent=4)

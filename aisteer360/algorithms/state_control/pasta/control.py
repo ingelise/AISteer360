@@ -33,8 +33,9 @@ class PASTA(StateControl):
     mitigation, or content filtering without architectural changes.
 
     Args:
-        alpha (float): Scaling factor for attention modification. Positive values increase attention, negative values
-            decrease attention. Defaults to 1.0.
+        alpha (float): Multiplicative scaling factor applied to attention weights (implemented as adding log(alpha)
+            to attention logits via the attention mask). Values > 1 amplify attention to the targeted span; values in
+            (0, 1) suppress it. Must be > 0. Defaults to 1.0.
         head_config (dict | list): Configuration specifying which layers/heads to modify. If dict, maps layer indices
             to lists of head indices. If list, applies to all heads in specified layers.
         scale_position (str): Strategy for applying attention scaling. Options:
@@ -166,7 +167,7 @@ class PASTA(StateControl):
             self._scale_constant = torch.tensor(
                 [self.alpha],
                 device=self.device,
-                dtype=tokenized.input_ids.dtype,
+                dtype=torch.float32,
             ).log()
 
         hooks: dict[str, list] = {"pre": [], "forward": [], "backward": []}
@@ -347,7 +348,7 @@ class PASTA(StateControl):
             ).contiguous()
             input_kwargs["attention_mask"] = attention_mask
 
-        attention_mask = attention_mask.to(hidden_states.dtype).contiguous()
+        attention_mask = attention_mask.to(hidden_states.dtype).contiguous().clone()
         if attention_mask.size(1) == 1:
             attention_mask = attention_mask.expand(
                 -1,
@@ -357,6 +358,11 @@ class PASTA(StateControl):
             ).contiguous()
 
         batch_size = attention_mask.size(0)
+
+        # beam search expands the batch dimension by num_beams; broadcast token_ranges to match
+        if batch_size > len(token_ranges):
+            token_ranges = [token_ranges[i % len(token_ranges)] for i in range(batch_size)]
+
         for batch_index in range(batch_size):
             for start_idx, end_idx in token_ranges[batch_index].tolist():
                 if start_idx == end_idx:

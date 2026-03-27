@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from aisteer360.algorithms.core.steering_utils import ensure_pad_token, merge_controls
+from aisteer360.algorithms.core.steering_utils import ensure_pad_token, merge_controls, to_left_pad
 from aisteer360.algorithms.input_control.base import InputControl
 from aisteer360.algorithms.output_control.base import OutputControl
 from aisteer360.algorithms.state_control.base import StateControl
@@ -267,10 +267,10 @@ class SteeringPipeline:
             runtime_kwargs: Per-call parameters for state control
             **kwargs: Additional arguments passed to get_hooks()
         """
+        self.state_control.reset()  # reset before get_hooks() to clear state from previous generation
         hooks = self.state_control.get_hooks(steered_input_ids, runtime_kwargs, **kwargs)
         self.state_control.set_hooks(hooks)
         self.state_control._model_ref = self.model
-        self.state_control.reset()
 
     def generate(
             self,
@@ -361,6 +361,9 @@ class SteeringPipeline:
         The strategy below uses teacher forcing, computes log P(ref_t | steered_input, ref_1, ..., ref_{t-1}) for each
         token in the reference sequence.
 
+        When all pipeline controls support batching, a single batched forward pass is used (inputs are left-padded
+        internally for correct positional alignment). Otherwise, falls back to sequential per-item processing.
+
         Args:
             input_ids: Input token IDs as list or tensor [seq_len] or [batch, seq_len]
             attention_mask: Optional attention mask matching input_ids shape
@@ -384,74 +387,153 @@ class SteeringPipeline:
         runtime_kwargs = runtime_kwargs or {}
         device = self.model.device
 
-        # input control
-        steered_input_ids, attention_mask = self._prepare_inputs(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            runtime_kwargs=runtime_kwargs,
-        )
-
         # normalize ref_output_ids
         if isinstance(ref_output_ids, list):
             ref_output_ids = torch.tensor(ref_output_ids, dtype=torch.long)
         if ref_output_ids.ndim == 1:
             ref_output_ids = ref_output_ids.unsqueeze(0)
         ref_output_ids = ref_output_ids.to(device)
-
-        batch_size = steered_input_ids.size(0)
         ref_len = ref_output_ids.size(1)
 
-        # broadcast single ref sequence across batch
-        if ref_output_ids.size(0) == 1 and batch_size > 1:
-            ref_output_ids = ref_output_ids.expand(batch_size, -1)
-
-        if ref_len == 0:
-            return torch.zeros((batch_size, 0), device=device, dtype=torch.float32)
-
-        # state control
-        self._setup_state_control(steered_input_ids, runtime_kwargs, **forward_kwargs)
-
-        # forward pass under state control context
         is_encoder_decoder = getattr(self.model.config, "is_encoder_decoder", False)
 
-        with self.state_control:
-            with torch.no_grad():
-                if is_encoder_decoder:
-                    outputs = self.model(
-                        input_ids=steered_input_ids,
-                        attention_mask=attention_mask,
-                        decoder_input_ids=ref_output_ids,
-                        **forward_kwargs,
-                    )
-                    # predicts ref[t+1] from ref[0:t]; logits[:, t, :] -> ref[t+1]
-                    # logits[:, :-1, :] aligns with targets ref[:, 1:]
-                    logits = outputs.logits[:, :-1, :]
-                    target_ids = ref_output_ids[:, 1:]
-                else:
-                    # concatenate input + ref for causal teacher forcing
-                    combined_ids = torch.cat([steered_input_ids, ref_output_ids], dim=1)
-                    combined_mask = torch.cat([
-                        attention_mask,
-                        torch.ones(batch_size, ref_len, device=device, dtype=attention_mask.dtype),
-                    ], dim=1)
+        # batched path (all controls are batch-safe)
+        if self.supports_batching:
+            # input control
+            steered_input_ids, attention_mask = self._prepare_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                runtime_kwargs=runtime_kwargs,
+            )
+            batch_size = steered_input_ids.size(0)
 
-                    outputs = self.model(
-                        input_ids=combined_ids,
-                        attention_mask=combined_mask,
-                        **forward_kwargs,
-                    )
+            # broadcast single ref sequence across batch
+            if ref_output_ids.size(0) == 1 and batch_size > 1:
+                ref_output_ids = ref_output_ids.expand(batch_size, -1)
 
-                    # logits at [input_len - 1] predicts ref[0]
-                    # logits at [input_len + ref_len - 2] predicts ref[ref_len - 1]
-                    input_len = steered_input_ids.size(1)
-                    logits = outputs.logits[:, input_len - 1: input_len + ref_len - 1, :]
-                    target_ids = ref_output_ids
+            if ref_len == 0:
+                return torch.zeros((batch_size, 0), device=device, dtype=torch.float32)
 
-        # compute logprobs
-        logprobs = torch.log_softmax(logits, dim=-1)
-        token_logprobs = logprobs.gather(
-            dim=-1,
-            index=target_ids.unsqueeze(-1),
-        ).squeeze(-1)
+            # left-pad for correct positional alignment in causal models; with right-padding, pad tokens between the
+            # real input and the appended ref tokens corrupt positional encodings and the causal attention chain
+            if not is_encoder_decoder:
+                steered_input_ids, attention_mask = to_left_pad(steered_input_ids, attention_mask)
 
-        return token_logprobs
+            # state control
+            self._setup_state_control(steered_input_ids, runtime_kwargs, **forward_kwargs)
+
+            # forward pass under state control context
+            with self.state_control:
+                with torch.no_grad():
+                    if is_encoder_decoder:
+                        outputs = self.model(
+                            input_ids=steered_input_ids,
+                            attention_mask=attention_mask,
+                            decoder_input_ids=ref_output_ids,
+                            **forward_kwargs,
+                        )
+                        # predicts ref[t+1] from ref[0:t]; logits[:, t, :] -> ref[t+1]
+                        # logits[:, :-1, :] aligns with targets ref[:, 1:]
+                        logits = outputs.logits[:, :-1, :]
+                        target_ids = ref_output_ids[:, 1:]
+                    else:
+                        # concatenate input + ref for causal teacher forcing
+                        combined_ids = torch.cat([steered_input_ids, ref_output_ids], dim=1)
+                        combined_mask = torch.cat([
+                            attention_mask,
+                            torch.ones(batch_size, ref_len, device=device, dtype=attention_mask.dtype),
+                        ], dim=1)
+
+                        outputs = self.model(
+                            input_ids=combined_ids,
+                            attention_mask=combined_mask,
+                            **forward_kwargs,
+                        )
+
+                        # logits at [input_len - 1] predicts ref[0]
+                        # logits at [input_len + ref_len - 2] predicts ref[ref_len - 1]
+                        input_len = steered_input_ids.size(1)
+                        logits = outputs.logits[:, input_len - 1: input_len + ref_len - 1, :]
+                        target_ids = ref_output_ids
+
+            # compute logprobs
+            logprobs = torch.log_softmax(logits, dim=-1)
+            return logprobs.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+
+        # sequential fallback (one or more controls do not support batching)
+
+        # normalize input_ids to 2D for indexing
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        input_ids = input_ids.to(device)
+
+        if attention_mask is not None:
+            if isinstance(attention_mask, list):
+                attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)
+            if attention_mask.ndim == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            attention_mask = attention_mask.to(device)
+
+        num_inputs = input_ids.size(0)
+
+        # broadcast single ref sequence across batch
+        if ref_output_ids.size(0) == 1 and num_inputs > 1:
+            ref_output_ids = ref_output_ids.expand(num_inputs, -1)
+
+        if ref_len == 0:
+            return torch.zeros((num_inputs, 0), device=device, dtype=torch.float32)
+
+        all_logprobs = []
+
+        for i in range(num_inputs):
+            single_input_ids = input_ids[i:i + 1]
+            single_attention_mask = attention_mask[i:i + 1] if attention_mask is not None else None
+            single_ref = ref_output_ids[i:i + 1]
+
+            # input control
+            steered_input_ids, steered_attention_mask = self._prepare_inputs(
+                input_ids=single_input_ids,
+                attention_mask=single_attention_mask,
+                runtime_kwargs=runtime_kwargs,
+            )
+
+            # state control
+            self._setup_state_control(steered_input_ids, runtime_kwargs, **forward_kwargs)
+
+            # forward pass under state control context
+            with self.state_control:
+                with torch.no_grad():
+                    if is_encoder_decoder:
+                        outputs = self.model(
+                            input_ids=steered_input_ids,
+                            attention_mask=steered_attention_mask,
+                            decoder_input_ids=single_ref,
+                            **forward_kwargs,
+                        )
+                        logits = outputs.logits[:, :-1, :]
+                        target_ids = single_ref[:, 1:]
+                    else:
+                        combined_ids = torch.cat([steered_input_ids, single_ref], dim=1)
+                        combined_mask = torch.cat([
+                            steered_attention_mask,
+                            torch.ones(1, ref_len, device=device, dtype=steered_attention_mask.dtype),
+                        ], dim=1)
+
+                        outputs = self.model(
+                            input_ids=combined_ids,
+                            attention_mask=combined_mask,
+                            **forward_kwargs,
+                        )
+
+                        input_len = steered_input_ids.size(1)
+                        logits = outputs.logits[:, input_len - 1: input_len + ref_len - 1, :]
+                        target_ids = single_ref
+
+            # compute logprobs
+            logprobs = torch.log_softmax(logits, dim=-1)
+            token_logprobs = logprobs.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+            all_logprobs.append(token_logprobs)
+
+        return torch.cat(all_logprobs, dim=0)
